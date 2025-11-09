@@ -1,11 +1,11 @@
 from config.base import BaseConfig
 
 class HRAConfig(BaseConfig):
-    # Training loop parameters
-    NUM_EPISODES = 20000
-    MAX_STEPS = 5000     # Max steps per episode
+    # Training loop parameters - reduced for faster training
+    NUM_EPISODES = 5000      # Reduced from 20000 for faster initial training
+    MAX_STEPS = 5000         # Max steps per episode
 
-    # Logging and saving
+    # Logging and saving - unchanged as requested
     LOG_INTERVAL = 10
     SAVE_INTERVAL = 500
     
@@ -13,14 +13,14 @@ class HRAConfig(BaseConfig):
     MODEL_DIR = "models/hra_agent"
     LOG_DIR = "results/hra_agent"
 
-    # HRA-specific hyperparameters from the paper/repo
-    REPLAY_MAX_SIZE = 100000  # Size of the experience replay buffer
-    REPLAY_MIN_SIZE = 10000   # Min experiences before learning starts
-    MINIBATCH_SIZE = 32
+    # HRA-specific hyperparameters optimized for speed and accuracy
+    REPLAY_MAX_SIZE = 50000   # Reduced from 100000 for faster startup
+    REPLAY_MIN_SIZE = 5000    # Reduced from 10000 for faster learning start
+    MINIBATCH_SIZE = 64       # Increased from 32 for better GPU utilization
     UPDATE_FREQ = 100         # How often to update the target network
-    LEARNING_FREQUENCY = 4    # Perform a learning step every N env steps
+    LEARNING_FREQUENCY = 2    # Reduced from 4 for more frequent learning
     
-    LEARNING_RATE = 0.001     # Corresponds to 'hra+1' mode
+    LEARNING_RATE = 0.003     # Increased from 0.001 for faster convergence
     GAMMA = 0.99              # Discount factor for future rewards
     
     # Epsilon-greedy exploration strategy
