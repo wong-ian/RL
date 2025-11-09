@@ -13,7 +13,7 @@ def main():
     logging.info("Visualizing HRA Agent.")
 
     # The model path should point to a saved checkpoint, e.g., the final one
-    model_path = "models/hra_agent/agent_ep500.pkl" 
+    model_path = "models/hra_agent/agent_final.pkl"
 
     env = gym.make("ALE/MsPacman-v5", render_mode="human")
     env = AtariPreprocessing(env, frame_skip=1, screen_size=84, grayscale_obs=True, scale_obs=False)
