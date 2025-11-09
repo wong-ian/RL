@@ -66,7 +66,14 @@ class HRANetwork(nn.Module):
 class HRAAgent(BaseAgent):
     def __init__(self, action_space, config):
         super().__init__(action_space, config)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Use MPS on Mac for GPU acceleration
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using Metal Performance Shaders (MPS) for GPU acceleration")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
         print(f"HRAAgent is using device: {self.device}")
 
         # The observation space for ALE MsPacman is (210, 160, 3). We'll use a wrapper for preprocessing
@@ -150,6 +157,8 @@ class HRAAgent(BaseAgent):
 
         self.optimizer.zero_grad()
         total_loss.backward()
+        # Add gradient clipping for training stability
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
         self.optimizer.step()
 
     def save(self, filepath):
