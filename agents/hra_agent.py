@@ -1,520 +1,244 @@
 """
-Microsoft HRA - EXACT Atari Implementation
-Complete implementation following the exact paper specifications
+Microsoft HRA - EXACT Deep Implementation
+Refactored based on Research Report
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import cv2
+import random
 from collections import deque
-import ale_py
-import gymnasium as gym
+
+# Assumes hra_network.py is in the root directory
+from hra_network import HRAMsPacmanNetwork
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, orientation, action, rewards, next_state, next_orientation, done):
+        self.buffer.append((state, orientation, action, rewards, next_state, next_orientation, done))
+    
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, orient, action, reward, next_state, next_orient, done = zip(*batch)
+        return (np.array(state), np.array(orient), np.array(action), 
+                np.array(reward), np.array(next_state), np.array(next_orient), np.array(done))
+    
+    def __len__(self):
+        return len(self.buffer)
 
 class MsPacManObjectExtractor:
-    """
-    Microsoft's exact object extraction preprocessing
-    Converts 210x160 ALE frames to 11 binary channels (40x40)
-    """
-    
     def __init__(self):
-        # Ms. Pac-Man color values (approximate - may need tuning)
         self.colors = {
-            'pacman': [210, 164, 74],      # Yellow
-            'ghost_red': [200, 72, 72],     # Red ghost
-            'ghost_pink': [180, 122, 48],   # Pink ghost  
-            'ghost_cyan': [84, 184, 153],   # Cyan ghost
-            'ghost_orange': [198, 108, 58], # Orange ghost
-            'ghost_blue': [66, 114, 194],   # Blue ghosts (edible)
-            'pellet': [228, 111, 111],      # Regular pellets
-            'power_pellet': [228, 111, 111], # Power pellets (larger)
-            'fruit': [184, 70, 162],        # Fruits
+            'pacman': [210, 164, 74],
+            'ghost_red': [200, 72, 72],
+            'ghost_pink': [180, 122, 48],
+            'ghost_cyan': [84, 184, 153],
+            'ghost_orange': [198, 108, 58],
+            'ghost_blue': [66, 114, 194],
+            'pellet': [228, 111, 111],
+            'fruit': [184, 70, 162],
         }
-        
-        print("Microsoft Object Extractor initialized")
-        print("   11 binary channels: Ms.Pac-Man + 4 ghosts + 4 blue ghosts + fruit + pellets")
-    
-    def crop_frame(self, frame):
-        """Crop 210x160 to 160x160 as per Microsoft paper"""
-        # Remove top 25 pixels and bottom 25 pixels
-        cropped = frame[25:185, :]  # 160x160
-        return cropped
     
     def extract_objects(self, frame):
-        """
-        Extract objects into 11 binary channels (40x40)
-        Returns: dict with binary masks for each object type
-        """
-        # Crop to 160x160
-        cropped = self.crop_frame(frame)
-        
-        # Resize to 40x40 (4 pixel accuracy as per paper)
+        cropped = frame[25:185, :]
         resized = cv2.resize(cropped, (40, 40), interpolation=cv2.INTER_NEAREST)
+        channels = np.zeros((11, 40, 40), dtype=np.float32)
         
-        channels = {}
-        
-        # Channel 0: Ms. Pac-Man
-        channels['pacman'] = self._detect_color(resized, self.colors['pacman'])
-        
-        # Channels 1-4: Individual ghosts
-        channels['ghost_red'] = self._detect_color(resized, self.colors['ghost_red'])
-        channels['ghost_pink'] = self._detect_color(resized, self.colors['ghost_pink'])
-        channels['ghost_cyan'] = self._detect_color(resized, self.colors['ghost_cyan'])
-        channels['ghost_orange'] = self._detect_color(resized, self.colors['ghost_orange'])
-        
-        # Channels 5-8: Blue ghosts (edible)
-        blue_mask = self._detect_color(resized, self.colors['ghost_blue'])
-        channels['blue_ghost_1'] = blue_mask  # All blue ghosts in one channel for now
-        channels['blue_ghost_2'] = np.zeros_like(blue_mask)
-        channels['blue_ghost_3'] = np.zeros_like(blue_mask) 
-        channels['blue_ghost_4'] = np.zeros_like(blue_mask)
-        
-        # Channel 9: Fruit
-        channels['fruit'] = self._detect_color(resized, self.colors['fruit'])
-        
-        # Channel 10: All pellets (regular + power pellets)
-        channels['pellets'] = self._detect_pellets(resized)
+        channels[0] = self._detect_color(resized, self.colors['pacman'])
+        channels[1] = self._detect_color(resized, self.colors['ghost_red'])
+        channels[2] = self._detect_color(resized, self.colors['ghost_pink'])
+        channels[3] = self._detect_color(resized, self.colors['ghost_cyan'])
+        channels[4] = self._detect_color(resized, self.colors['ghost_orange'])
+        channels[5] = self._detect_color(resized, self.colors['ghost_blue'])
+        channels[9] = self._detect_color(resized, self.colors['fruit'])
+        channels[10] = self._detect_pellets(resized)
         
         return channels
-    
+
     def _detect_color(self, frame, target_color, tolerance=30):
-        """Detect pixels matching target color within tolerance"""
         diff = np.abs(frame.astype(np.int32) - np.array(target_color))
         mask = np.all(diff < tolerance, axis=2)
         return mask.astype(np.float32)
     
     def _detect_pellets(self, frame):
-        """Detect all pellets (small bright dots)"""
-        # Convert to grayscale and find bright small objects
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         bright_mask = gray > 200
         return bright_mask.astype(np.float32)
 
-class GeneralValueFunction:
-    """
-    Microsoft's General Value Function (GVF) for specific map locations
-    Uses EXACT parameters from the paper: α=1, γ=0.99
-    """
-    
-    def __init__(self, location, map_id):
-        self.location = location  # (x, y) position
-        self.map_id = map_id
-        self.q_table = {}  # state -> action -> value
-        self.learning_rate = 1.0  # Microsoft uses α=1
-        self.gamma = 0.99
-    
-    def get_q_value(self, state, action):
-        """Get Q-value for state-action pair"""
-        if state not in self.q_table:
-            self.q_table[state] = {}
-        if action not in self.q_table[state]:
-            self.q_table[state][action] = 0.0
-        return self.q_table[state][action]
-    
-    def update(self, state, action, reward, next_state, done):
-        """
-        Update GVF Q-values using Expected Sarsa, as per the paper's
-        method for navigation-based domains (learning the value of a random policy).
-        """
-        current_q = self.get_q_value(state, action)
-        
-        if done:
-            target = reward
-        else:
-            # Expected Sarsa: Average over all possible next actions for a random policy
-            num_actions = 9  # Ms. Pac-Man has 9 actions
-            expected_next_q = sum(self.get_q_value(next_state, a) for a in range(num_actions)) / num_actions
-            target = reward + self.gamma * expected_next_q
-        
-        # TD update with α=1
-        self.q_table[state][action] = current_q + self.learning_rate * (target - current_q)
-
-class ExecutiveMemory:
-    """
-    Microsoft's executive memory system
-    Records successful action sequences for each level
-    """
-    
-    def __init__(self):
-        self.level_memories = {}  # level -> list of successful action sequences
-        self.current_sequence = []
-        self.current_level = 1
-        
-        print("Executive Memory initialized - will record winning strategies")
-    
-    def record_action(self, action):
-        """Record action in current sequence"""
-        self.current_sequence.append(action)
-    
-    def level_completed_successfully(self, level):
-        """Store successful sequence for this level"""
-        if self.current_sequence:
-            if level not in self.level_memories:
-                self.level_memories[level] = []
-            self.level_memories[level].append(self.current_sequence.copy())
-            print(f"Executive Memory: Recorded {len(self.current_sequence)} actions for level {level}")
-        self.current_sequence = []
-    
-    def level_failed(self):
-        """Clear current sequence only on actual level/game failure"""
-        # Only clear if we actually failed the level, not just lost a life
-        self.current_sequence = []
-    
-    def get_preferred_action(self, level, step):
-        """Get memorized action for this level and step"""
-        if level in self.level_memories and self.level_memories[level]:
-            # Use most recent successful sequence
-            sequence = self.level_memories[level][-1]
-            if step < len(sequence):
-                return sequence[step]
-        return None
-
 class MicrosoftHRAAgent:
-    """
-    Microsoft's EXACT HRA architecture for Ms. Pac-Man
-    Based on the complete implementation details from the paper
-    """
-    
-    def __init__(self, num_actions):
+    def __init__(self, num_actions, config=None):
         self.num_actions = num_actions
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"HRA Agent running on: {self.device}")
+
+        self.lr = config.LEARNING_RATE if config else 0.0001
+        self.gamma = config.GAMMA if config else 0.99
+        self.use_normalization = True 
         
-        # Object extractor
         self.object_extractor = MsPacManObjectExtractor()
+        self.model = HRAMsPacmanNetwork(num_actions=num_actions).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.memory = ReplayBuffer(capacity=10000)
+        self.batch_size = 32
         
-        # Microsoft's exact GVF structure
-        self.position_gvfs = {}  # (map_id, x, y) -> GVF
-        self.visited_positions = set()  # Track all visited positions
+        self.last_orientation = np.array([1, 0, 0, 0], dtype=np.float32)
+        self.total_steps = 0
+        self.pacman_pos_idx = (20, 20)
+        self.visit_counts = np.zeros((40, 40, 9), dtype=np.int32)
         
-        # Microsoft's object multipliers (exact from paper)
-        self.object_multipliers = {
-            'pellet': 10,
-            'power_pellet': 50,
-            'fruit': 200,  # Base fruit value, will be adjusted by fruit type
-            'blue_ghost': 1000,
-            'ghost': -1000,  # Avoidance multiplier
-            'ghost_normalized': -10  # After normalization
-        }
-        
-        # Fruit point values (exact from paper Table 3)
-        self.fruit_values = {
-            'cherry': 100, 'strawberry': 200, 'orange': 500, 'pretzel': 700,
-            'apple': 1000, 'pear': 2000, 'banana': 5000
-        }
-        
-        # Executive memory
-        self.executive_memory = ExecutiveMemory()
-        
-        # Exploration - Microsoft's exact implementation
-        self.visit_counts = {}  # (state, action) -> count
-        self.total_actions = 0
-        self.kappa = 4  # Microsoft's κ parameter
-        
-        # Training state
-        self.current_level = 1
-        self.current_map = 1  # Maps cycle: 1(red)->2(blue)->3(white)->4(green)
-        self.episode_step = 0
-        self.last_lives = 4 # Ms. Pac-Man starts with 4 lives
-        self.last_score = 0  # Track score for level completion detection
-        self.pacman_position = (20, 20)  # Current Ms. Pac-Man position
-        self.pacman_direction = 'E'  # N, E, S, W
-        self.lost_life_this_level = False # Track for executive memory
-        self.last_pellet_count = 0 # Track for level completion
-        
-        # Score normalization flag
-        self.use_score_normalization = True
-        
-        print("Microsoft HRA Agent initialized - EXACT IMPLEMENTATION")
-        print(f"   {num_actions} actions")
-        print("   Position-based GVFs (4 maps x ~400 positions)")
-        print("   Object multipliers: pellet=10, power=50, fruit=200, ghost=-1000")
-        print("   Score head normalization enabled")
-        print("   Targeted exploration (UCB-style)")
-    
-    def reset(self):
-        """Resets the agent's state for a new episode."""
-        self.current_level = 1
-        self.episode_step = 0
-        self.last_lives = 4  # Ms. Pac-Man starts with 4 lives in ALE
-        self.last_score = 0
-        self.lost_life_this_level = False
-        self.last_pellet_count = 0
-        self.executive_memory.current_sequence = []
-        print("Agent state reset for new episode.")
-    
-    def preprocess_observation(self, obs):
-        """Convert raw observation to object channels"""
+    def preprocess(self, obs):
         return self.object_extractor.extract_objects(obs)
-    
-    def _get_object_positions(self, channel):
-        """Extract object positions from binary channel"""
-        positions = []
-        indices = np.where(channel > 0.5)
-        for y, x in zip(indices[0], indices[1]):
-            positions.append((x, y))
-        return positions
-    
-    def get_pacman_state(self, channels):
-        """
-        Extract Ms. Pac-Man position and direction from channels
-        Returns: (map_id, x, y, direction) - Microsoft's exact state representation
-        """
-        # Find Ms. Pac-Man position
-        pacman_positions = self._get_object_positions(channels['pacman'])
-        
-        if pacman_positions:
-            x, y = pacman_positions[0]  # Take first detected position
-            self.pacman_position = (x, y)
-            
-            # Determine direction based on movement (simplified)
-            # In full implementation, this would track movement between frames
-            direction = self.pacman_direction  # Keep current direction
-            
-            # Map ID based on level (cycles every 4 levels)
-            map_id = ((self.current_level - 1) % 4) + 1
-            
-            return (map_id, x, y, direction)
-        else:
-            # Fallback to last known position
-            map_id = ((self.current_level - 1) % 4) + 1
-            return (map_id, self.pacman_position[0], self.pacman_position[1], self.pacman_direction)
-    
-    def get_or_create_position_gvf(self, map_id, x, y):
-        """
-        Get or create GVF for specific map position
-        Microsoft's online GVF creation
-        """
-        position_key = (map_id, x, y)
-        
-        if position_key not in self.position_gvfs:
-            # Create new GVF for this position
-            self.position_gvfs[position_key] = GeneralValueFunction(
-                location=(x, y), 
-                map_id=map_id
-            )
-            self.visited_positions.add(position_key)
-            # Only log every 50th GVF creation to reduce noise
-            if len(self.position_gvfs) % 50 == 0:
-                print(f"Created {len(self.position_gvfs)} position GVFs (latest: {x}, {y} on map {map_id})")
-        
-        return self.position_gvfs[position_key]
-    
-    def get_object_positions_with_types(self, channels):
-        """
-        Extract all object positions with their types
-        Returns: list of (object_type, x, y, value)
-        """
-        objects = []
-        
-        # Pellets (regular)
-        pellet_positions = self._get_object_positions(channels['pellets'])
-        for x, y in pellet_positions:
-            objects.append(('pellet', x, y, self.object_multipliers['pellet']))
-        
-        # Ghosts (regular - avoid)
-        for ghost_type in ['ghost_red', 'ghost_pink', 'ghost_cyan', 'ghost_orange']:
-            ghost_positions = self._get_object_positions(channels[ghost_type])
-            for x, y in ghost_positions:
-                multiplier = self.object_multipliers['ghost_normalized'] if self.use_score_normalization else self.object_multipliers['ghost']
-                objects.append(('ghost', x, y, multiplier))
-        
-        # Blue ghosts (edible)
-        blue_positions = self._get_object_positions(channels['blue_ghost_1'])
-        for x, y in blue_positions:
-            objects.append(('blue_ghost', x, y, self.object_multipliers['blue_ghost']))
-        
-        # Fruits
-        fruit_positions = self._get_object_positions(channels['fruit'])
-        for x, y in fruit_positions:
-            # Use base fruit multiplier (could be enhanced with fruit type detection)
-            objects.append(('fruit', x, y, self.object_multipliers['fruit']))
-        
-        return objects
-    
-    def get_action(self, observation, info):
-        """Microsoft's EXACT action selection algorithm"""
-        # Preprocess observation to get object channels
-        channels = self.preprocess_observation(observation)
-        
-        # Get current state (position + direction)
-        state = self.get_pacman_state(channels)
-        map_id, pac_x, pac_y, direction = state
-        
-        # Create/get GVF for current position
-        current_gvf = self.get_or_create_position_gvf(map_id, pac_x, pac_y)
-        
-        # Check executive memory first (reduce logging frequency)
-        executive_action = self.executive_memory.get_preferred_action(self.current_level, self.episode_step)
-        if executive_action is not None:
-            # Only log executive memory usage occasionally
-            if self.episode_step % 20 == 0:
-                print(f"Executive Memory: Using memorized action {executive_action}")
-            self.episode_step += 1
-            return executive_action
-        
-        # Get all objects on screen with positions and values
-        objects = self.get_object_positions_with_types(channels)
-        
-        # Initialize Q-values for all actions
-        positive_q_values = np.zeros(self.num_actions)
-        negative_q_values = np.zeros(self.num_actions)
-        
-        # AGGREGATOR: Separate positive (score) and negative (ghost) heads
-        for obj_type, obj_x, obj_y, multiplier in objects:
-            target_gvf = self.get_or_create_position_gvf(map_id, obj_x, obj_y)
-            for action in range(self.num_actions):
-                q_val = target_gvf.get_q_value(state, action)
-                if multiplier > 0:
-                    positive_q_values[action] += q_val * multiplier
-                else:
-                    # Use the correct ghost multiplier based on normalization
-                    ghost_multiplier = self.object_multipliers['ghost_normalized'] if self.use_score_normalization else self.object_multipliers['ghost']
-                    negative_q_values[action] += q_val * ghost_multiplier
 
-        # SCORE HEADS NORMALIZATION (Microsoft's key innovation)
-        if self.use_score_normalization and np.max(positive_q_values) > 0:
-            positive_q_values /= np.max(positive_q_values)
-            
-        # Combine normalized score heads with ghost heads
-        total_q_values = positive_q_values + negative_q_values
+    def get_pacman_pos(self, channels):
+        indices = np.where(channels[0] > 0.5)
+        if len(indices[0]) > 0:
+            return (indices[0][0], indices[1][0])
+        return self.pacman_pos_idx
+
+    def get_aggregated_q_values(self, state_channels, orientation, pacman_pos_idx):
+        """
+        Calculates aggregated Q-values using Normalization 
+        and Exploration Heads.
+        """
+        state_t = torch.FloatTensor(state_channels).unsqueeze(0).to(self.device)
+        orient_t = torch.FloatTensor(orientation).unsqueeze(0).to(self.device)
         
-        # DIVERSIFICATION HEAD (first 50 steps only)
-        if self.episode_step < 50:
-            diversification_bonus = np.random.uniform(0, 20, self.num_actions)
-            total_q_values += diversification_bonus
-        
-        # TARGETED EXPLORATION HEAD (Microsoft's UCB-style with enhancements)
-        for action in range(self.num_actions):
-            state_action_key = (state, action)
-            count = self.visit_counts.get(state_action_key, 0)
+        with torch.no_grad():
+            gvf_vals, ghost_vals, blue_vals, fruit_vals = self.model(state_t, orient_t)
             
-            # Use the exact formula from the paper's supplement: κ * sqrt(4*N / n(s,a))
-            if self.total_actions > 0 and count > 0:
-                exploration_bonus = self.kappa * np.sqrt(4 * self.total_actions / count)
+        # 1. POSITIVE Rewards
+        pellet_mask = torch.FloatTensor(state_channels[10]).to(self.device)
+        # GVF (Navigation) * Pellet Mask = Value of eating pellets
+        pellet_q = (gvf_vals * pellet_mask.unsqueeze(0).unsqueeze(0) * 10.0).sum(dim=(2, 3)) 
+        
+        fruit_exists = state_channels[9].max() > 0
+        fruit_q = fruit_vals.squeeze(0).squeeze(1) if fruit_exists else torch.zeros(self.num_actions).to(self.device)
+        blue_ghost_q = blue_vals.squeeze(0).sum(dim=1)
+        
+        total_positive_q = pellet_q.squeeze(0) + fruit_q + blue_ghost_q
+        
+        # 2. NORMALIZATION
+        if self.use_normalization:
+            min_q = total_positive_q.min()
+            max_q = total_positive_q.max()
+            span = max_q - min_q
+            if span > 1e-6:
+                norm_positive_q = (total_positive_q - min_q) / span
             else:
-                # Encourage trying unvisited actions with a large bonus
-                exploration_bonus = self.kappa * np.sqrt(4 * self.total_actions) if self.total_actions > 0 else self.kappa
-                
-            total_q_values[action] += exploration_bonus
-        
-        # Final action selection is greedy w.r.t. the aggregated Q-values from all heads
-        action = np.argmax(total_q_values)
-        
-        # Update visit counts
-        state_action_key = (state, action)
-        if state_action_key not in self.visit_counts:
-            self.visit_counts[state_action_key] = 0
-        self.visit_counts[state_action_key] += 1
-        self.total_actions += 1
-        
-        # Record in executive memory
-        self.executive_memory.record_action(action)
-        
-        self.episode_step += 1
-        return action
-    
-    def update(self, obs, action, reward, next_obs, done, info):
-        """Update all position GVFs using Microsoft's method"""
-        
-        # --- Executive Memory & Level Completion Logic ---
-        current_lives = info.get('lives', 4)
-        
-        # 1. Check for level completion (all pellets eaten)
-        # A simple proxy is to check if the number of pellets is zero in the next state
-        next_channels = self.preprocess_observation(next_obs)
-        pellet_count = np.sum(next_channels['pellets'])
-        
-        if pellet_count == 0 and self.last_pellet_count > 0:
-            # Level completed successfully
-            if not self.lost_life_this_level:
-                self.executive_memory.level_completed_successfully(self.current_level)
-            
-            # Reset for next level
-            self.current_level += 1
-            self.lost_life_this_level = False
-            self.executive_memory.current_sequence = [] # Start fresh sequence for new level
-            print(f"LEVEL {self.current_level-1} COMPLETE! Advancing to level {self.current_level}.")
-
-        # 2. Check for life loss
-        if current_lives < self.last_lives:
-            self.lost_life_this_level = True
-            self.executive_memory.level_failed() # Clear current action sequence
-            print(f"Life lost - clearing current action sequence from executive memory.")
-
-        self.last_lives = current_lives
-        self.last_pellet_count = pellet_count
-        # --- End of Executive Memory Logic ---
-
-        # Get state representations
-        channels = self.preprocess_observation(obs)
-        next_channels = self.preprocess_observation(next_obs)
-        
-        state = self.get_pacman_state(channels)
-        next_state = self.get_pacman_state(next_channels)
-        
-        # Update all GVFs for visited positions
-        for position_key, gvf in self.position_gvfs.items():
-            map_id, pos_x, pos_y = position_key
-            
-            # Calculate pseudo-reward for this position
-            pseudo_reward = self._calculate_pseudo_reward(state, position_key, reward)
-            
-            # Update GVF with Microsoft's parameters (α=1, γ=0.99)
-            gvf.learning_rate = 1.0  # Microsoft uses α=1
-            gvf.gamma = 0.99
-            gvf.update(state, action, pseudo_reward, next_state, done)
-        
-        if done:
-            self.episode_step = 0
-    
-    def _calculate_pseudo_reward(self, state, target_position, actual_reward):
-        """
-        Calculate pseudo-reward for reaching target position
-        Microsoft's GVF reward assignment
-        """
-        map_id, pac_x, pac_y, direction = state
-        target_map, target_x, target_y = target_position
-        
-        # Reward for being at or near target position
-        if (map_id == target_map and 
-            abs(pac_x - target_x) <= 1 and 
-            abs(pac_y - target_y) <= 1):
-            return 1.0
+                norm_positive_q = torch.zeros_like(total_positive_q)
         else:
-            return 0.0
+            norm_positive_q = total_positive_q
 
-# Test the Microsoft HRA system
-def test_microsoft_hra():
-    """Test the complete Microsoft HRA implementation"""
-    print("TESTING MICROSOFT'S EXACT HRA ARCHITECTURE")
-    print("=" * 60)
-    
-    # Create environment
-    env = gym.make('ALE/MsPacman-v5')
-    
-    # Create Microsoft HRA agent  
-    num_actions = 9  # Ms. Pac-Man standard action space
-    agent = MicrosoftHRAAgent(num_actions)
-    
-    print("Microsoft HRA Agent created successfully")
-    print(f"Action space: {num_actions}")
-    
-    # Test preprocessing
-    obs, info = env.reset()
-    channels = agent.preprocess_observation(obs)
-    
-    print("\nObject Channel Extraction Test:")
-    for name, channel in channels.items():
-        objects_found = np.sum(channel > 0.5)
-        print(f"   {name}: {objects_found} pixels detected")
-    
-    # Test action selection
-    action = agent.get_action(obs, info)
-    print(f"\nFirst action selected: {action}")
-    print(f"Position GVFs created: {len(agent.position_gvfs)}")
-    print(f"Visited positions: {len(agent.visited_positions)}")
-    
-    env.close()
-    print("\nMicrosoft HRA system test completed successfully!")
+        # 3. NEGATIVE Rewards
+        ghost_weight = -10.0 if self.use_normalization else -1000.0
+        total_negative_q = ghost_vals.squeeze(0).sum(dim=1) * ghost_weight
+        
+        # 4. EXPLORATION
+        div_q = torch.zeros(self.num_actions).to(self.device)
+        if self.total_steps < 50:
+            div_q = torch.rand(self.num_actions).to(self.device) * 20.0
+            
+        y, x = pacman_pos_idx
+        y = min(max(y, 0), 39)
+        x = min(max(x, 0), 39)
+        counts = self.visit_counts[y, x, :]
+        
+        exploration_bonus = np.sqrt(self.total_steps / (counts + 1.0)) * 0.1
+        exp_q = torch.FloatTensor(exploration_bonus).to(self.device)
+        
+        final_q = norm_positive_q + total_negative_q + div_q + exp_q
+        return final_q
 
-if __name__ == "__main__":
-    test_microsoft_hra()
+    def get_action(self, obs, info=None):
+        channels = self.preprocess(obs)
+        self.pacman_pos_idx = self.get_pacman_pos(channels)
+        orientation = self.last_orientation
+        final_q = self.get_aggregated_q_values(channels, orientation, self.pacman_pos_idx)
+        action = torch.argmax(final_q).item()
+        
+        y, x = self.pacman_pos_idx
+        self.visit_counts[y, x, action] += 1
+        return action
+
+    def update(self, obs, action, reward_decomposed, next_obs, done, info):
+        self.total_steps += 1
+        
+        state = self.preprocess(obs)
+        next_state = self.preprocess(next_obs)
+        orientation = self.last_orientation
+        next_orientation = self.last_orientation
+        
+        if 'decomposed_reward' in info:
+             # Wrapper returns: ['pellet', 'power_pellet', 'eat_ghost', 'fruit', 'death']
+             rewards = info['decomposed_reward'] 
+        else:
+             rewards = np.zeros(5)
+             rewards[0] = float(reward_decomposed)
+             
+        self.memory.push(state, orientation, action, rewards, next_state, next_orientation, done)
+        
+        if len(self.memory) < 1000:
+            return
+            
+        # --- Real Training Step ---
+        states, orients, actions, rewards, next_states, next_orients, dones = self.memory.sample(self.batch_size)
+        
+        states_t = torch.FloatTensor(states).to(self.device)
+        orients_t = torch.FloatTensor(orients).to(self.device)
+        actions_t = torch.LongTensor(actions).to(self.device)     # (Batch)
+        rewards_t = torch.FloatTensor(rewards).to(self.device)    # (Batch, 5)
+        next_states_t = torch.FloatTensor(next_states).to(self.device)
+        next_orients_t = torch.FloatTensor(next_orients).to(self.device)
+        dones_t = torch.FloatTensor(dones).to(self.device)        # (Batch)
+
+        # 1. Get Current Q-Values for all heads
+        # Shapes: GVF(B,9,40,40), Ghost(B,9,4), Blue(B,9,4), Fruit(B,9,1)
+        gvf, ghosts, blue, fruit = self.model(states_t, orients_t)
+
+        # 2. Get Next State Q-Values (for bootstrapping)
+        with torch.no_grad():
+            next_gvf, next_ghost, next_blue, next_fruit = self.model(next_states_t, next_orients_t)
+
+        # --- LOSS CALCULATION PER HEAD ---
+        total_loss = 0
+        
+        # A. PELLET HEAD (GVF)
+        # Reward Index 0 is Pellet
+        curr_q_pellet = gvf.mean(dim=(2,3)).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        next_q_pellet = next_gvf.mean(dim=(2,3)).max(1)[0]
+        target_pellet = rewards_t[:, 0] + (self.gamma * next_q_pellet * (1 - dones_t))
+        loss_pellet = nn.MSELoss()(curr_q_pellet, target_pellet)
+        total_loss += loss_pellet
+
+        # B. GHOST HEAD (Avoidance)
+        # Reward Index 4 is Death (-100). 
+        # Ghost head outputs 4 values (one per ghost). We sum them for a "Total Threat" estimate.
+        curr_q_ghost = ghosts.sum(dim=2).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        next_q_ghost = next_ghost.sum(dim=2).max(1)[0]
+        # Use Death penalty (index 4)
+        target_ghost = rewards_t[:, 4] + (self.gamma * next_q_ghost * (1 - dones_t))
+        loss_ghost = nn.MSELoss()(curr_q_ghost, target_ghost)
+        total_loss += loss_ghost
+
+        # C. FRUIT HEAD
+        # Reward Index 3 is Fruit
+        curr_q_fruit = fruit.squeeze(2).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        next_q_fruit = next_fruit.squeeze(2).max(1)[0]
+        target_fruit = rewards_t[:, 3] + (self.gamma * next_q_fruit * (1 - dones_t))
+        loss_fruit = nn.MSELoss()(curr_q_fruit, target_fruit)
+        total_loss += loss_fruit
+
+        # Optimization
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+    def save(self, path):
+        torch.save(self.model.state_dict(), path)
+        
+    def load(self, path):
+        self.model.load_state_dict(torch.load(path))
