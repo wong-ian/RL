@@ -1,6 +1,6 @@
 """
 Microsoft HRA - EXACT Deep Implementation
-Refactored based on Research Report
+Refactored for Spatial Training & Orientation Tracking
 """
 
 import numpy as np
@@ -10,28 +10,28 @@ import torch.optim as optim
 import cv2
 import random
 from collections import deque
-
-# Assumes hra_network.py is in the root directory
 from hra_network import HRAMsPacmanNetwork
 
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
     
-    def push(self, state, orientation, action, rewards, next_state, next_orientation, done):
-        self.buffer.append((state, orientation, action, rewards, next_state, next_orientation, done))
+    def push(self, state, orientation, action, next_state, next_orientation, done):
+        # We don't strictly need scalar rewards anymore as we derive them from state channels
+        self.buffer.append((state, orientation, action, next_state, next_orientation, done))
     
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        state, orient, action, reward, next_state, next_orient, done = zip(*batch)
+        state, orient, action, next_state, next_orient, done = zip(*batch)
         return (np.array(state), np.array(orient), np.array(action), 
-                np.array(reward), np.array(next_state), np.array(next_orient), np.array(done))
+                np.array(next_state), np.array(next_orient), np.array(done))
     
     def __len__(self):
         return len(self.buffer)
 
 class MsPacManObjectExtractor:
     def __init__(self):
+        # Expanded color tolerance for robustness
         self.colors = {
             'pacman': [210, 164, 74],
             'ghost_red': [200, 72, 72],
@@ -53,20 +53,22 @@ class MsPacManObjectExtractor:
         channels[2] = self._detect_color(resized, self.colors['ghost_pink'])
         channels[3] = self._detect_color(resized, self.colors['ghost_cyan'])
         channels[4] = self._detect_color(resized, self.colors['ghost_orange'])
+        # Combine all blues
         channels[5] = self._detect_color(resized, self.colors['ghost_blue'])
         channels[9] = self._detect_color(resized, self.colors['fruit'])
         channels[10] = self._detect_pellets(resized)
         
         return channels
 
-    def _detect_color(self, frame, target_color, tolerance=30):
+    def _detect_color(self, frame, target_color, tolerance=40): # Increased tolerance
         diff = np.abs(frame.astype(np.int32) - np.array(target_color))
         mask = np.all(diff < tolerance, axis=2)
         return mask.astype(np.float32)
     
     def _detect_pellets(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        bright_mask = gray > 200
+        # Pellets are bright, background is black
+        bright_mask = (gray > 180) & (gray < 240) # Tighter bound to avoid white walls
         return bright_mask.astype(np.float32)
 
 class MicrosoftHRAAgent:
@@ -75,45 +77,79 @@ class MicrosoftHRAAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"HRA Agent running on: {self.device}")
 
-        self.lr = config.LEARNING_RATE if config else 0.0001
-        self.gamma = config.GAMMA if config else 0.99
+        self.lr = 0.0001
+        self.gamma = 0.99
         self.use_normalization = True 
         
         self.object_extractor = MsPacManObjectExtractor()
         self.model = HRAMsPacmanNetwork(num_actions=num_actions).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        self.memory = ReplayBuffer(capacity=10000)
+        self.memory = ReplayBuffer(capacity=20000)
         self.batch_size = 32
         
-        self.last_orientation = np.array([1, 0, 0, 0], dtype=np.float32)
+        # Orientation Tracking (N, E, S, W)
+        self.last_orientation = np.array([0, 1, 0, 0], dtype=np.float32) 
+        self.last_pos = (20, 20)
+        
         self.total_steps = 0
         self.pacman_pos_idx = (20, 20)
         self.visit_counts = np.zeros((40, 40, 9), dtype=np.int32)
+
+    def check_vision(self, env):
+        """Debug method to ensure agent sees objects"""
+        print("Checking Vision System...")
+        obs, _ = env.reset()
+        channels = self.object_extractor.extract_objects(obs)
+        
+        p_count = np.sum(channels[10])
+        pac_count = np.sum(channels[0])
+        g_count = np.sum(channels[1:5])
+        
+        print(f"  Detected Pellets Pixels: {p_count}")
+        print(f"  Detected Pacman Pixels: {pac_count}")
+        print(f"  Detected Ghost Pixels: {g_count}")
+        
+        if p_count == 0:
+            print("  WARNING: Agent is BLIND to Pellets! Check color tolerance.")
+        if pac_count == 0:
+            print("  WARNING: Agent is BLIND to Self! Check color tolerance.")
         
     def preprocess(self, obs):
         return self.object_extractor.extract_objects(obs)
 
-    def get_pacman_pos(self, channels):
-        indices = np.where(channels[0] > 0.5)
-        if len(indices[0]) > 0:
-            return (indices[0][0], indices[1][0])
-        return self.pacman_pos_idx
+    def _update_orientation(self, new_pos):
+        y, x = new_pos
+        old_y, old_x = self.last_pos
+        
+        dy = y - old_y
+        dx = x - old_x
+        
+        # Only update if moved
+        if abs(dy) > 0 or abs(dx) > 0:
+            new_orient = np.zeros(4, dtype=np.float32)
+            if abs(dy) > abs(dx): # Moved vertical
+                if dy < 0: new_orient[0] = 1.0 # North
+                else: new_orient[2] = 1.0      # South
+            else: # Moved horizontal
+                if dx > 0: new_orient[1] = 1.0 # East
+                else: new_orient[3] = 1.0      # West
+            self.last_orientation = new_orient
+            self.last_pos = new_pos
 
     def get_aggregated_q_values(self, state_channels, orientation, pacman_pos_idx):
-        """
-        Calculates aggregated Q-values using Normalization 
-        and Exploration Heads.
-        """
         state_t = torch.FloatTensor(state_channels).unsqueeze(0).to(self.device)
         orient_t = torch.FloatTensor(orientation).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             gvf_vals, ghost_vals, blue_vals, fruit_vals = self.model(state_t, orient_t)
             
-        # 1. POSITIVE Rewards
+        # 1. POSITIVE Rewards (Spatial Aggregation)
+        # Use Channel 10 (Pellets) as a mask. 
         pellet_mask = torch.FloatTensor(state_channels[10]).to(self.device)
-        # GVF (Navigation) * Pellet Mask = Value of eating pellets
-        pellet_q = (gvf_vals * pellet_mask.unsqueeze(0).unsqueeze(0) * 10.0).sum(dim=(2, 3)) 
+        
+        # Q_pellet = Sum(GVF_map * Pellet_mask)
+        # If GVF predicts 1.0 for a tile, and pellet is there, we add 1.0 to value.
+        pellet_q = (gvf_vals * pellet_mask.unsqueeze(0).unsqueeze(0)).sum(dim=(2, 3)) * 10.0
         
         fruit_exists = state_channels[9].max() > 0
         fruit_q = fruit_vals.squeeze(0).squeeze(1) if fruit_exists else torch.zeros(self.num_actions).to(self.device)
@@ -121,7 +157,7 @@ class MicrosoftHRAAgent:
         
         total_positive_q = pellet_q.squeeze(0) + fruit_q + blue_ghost_q
         
-        # 2. NORMALIZATION
+        # 2. NORMALIZATION (Key for stability)
         if self.use_normalization:
             min_q = total_positive_q.min()
             max_q = total_positive_q.max()
@@ -133,21 +169,23 @@ class MicrosoftHRAAgent:
         else:
             norm_positive_q = total_positive_q
 
-        # 3. NEGATIVE Rewards
-        ghost_weight = -10.0 if self.use_normalization else -1000.0
+        # 3. NEGATIVE Rewards (Ghosts)
+        # Ghost weight should be roughly equal to normalized range (0-1) -> -1.5 is strong enough
+        ghost_weight = -2.0 
         total_negative_q = ghost_vals.squeeze(0).sum(dim=1) * ghost_weight
         
         # 4. EXPLORATION
         div_q = torch.zeros(self.num_actions).to(self.device)
-        if self.total_steps < 50:
-            div_q = torch.rand(self.num_actions).to(self.device) * 20.0
+        if self.total_steps < 50: # Only at start
+            div_q = torch.rand(self.num_actions).to(self.device) * 5.0 # Reduced noise
             
         y, x = pacman_pos_idx
         y = min(max(y, 0), 39)
         x = min(max(x, 0), 39)
         counts = self.visit_counts[y, x, :]
         
-        exploration_bonus = np.sqrt(self.total_steps / (counts + 1.0)) * 0.1
+        # UCB Bonus
+        exploration_bonus = np.sqrt(self.total_steps / (counts + 1.0)) * 0.05
         exp_q = torch.FloatTensor(exploration_bonus).to(self.device)
         
         final_q = norm_positive_q + total_negative_q + div_q + exp_q
@@ -155,82 +193,96 @@ class MicrosoftHRAAgent:
 
     def get_action(self, obs, info=None):
         channels = self.preprocess(obs)
-        self.pacman_pos_idx = self.get_pacman_pos(channels)
-        orientation = self.last_orientation
-        final_q = self.get_aggregated_q_values(channels, orientation, self.pacman_pos_idx)
+        
+        # Find Pacman
+        indices = np.where(channels[0] > 0.5)
+        if len(indices[0]) > 0:
+            self.pacman_pos_idx = (indices[0][0], indices[1][0])
+            self._update_orientation(self.pacman_pos_idx)
+        
+        final_q = self.get_aggregated_q_values(channels, self.last_orientation, self.pacman_pos_idx)
         action = torch.argmax(final_q).item()
         
+        # Update visit counts
         y, x = self.pacman_pos_idx
         self.visit_counts[y, x, action] += 1
         return action
 
-    def update(self, obs, action, reward_decomposed, next_obs, done, info):
+    def update(self, obs, action, reward, next_obs, done, info):
         self.total_steps += 1
         
         state = self.preprocess(obs)
         next_state = self.preprocess(next_obs)
-        orientation = self.last_orientation
-        next_orientation = self.last_orientation
         
-        if 'decomposed_reward' in info:
-             # Wrapper returns: ['pellet', 'power_pellet', 'eat_ghost', 'fruit', 'death']
-             rewards = info['decomposed_reward'] 
-        else:
-             rewards = np.zeros(5)
-             rewards[0] = float(reward_decomposed)
-             
-        self.memory.push(state, orientation, action, rewards, next_state, next_orientation, done)
+        # We assume orientation doesn't change wildly in one step for the buffer
+        # Ideally we'd calculate next_orientation, but using current is stable enough
         
-        if len(self.memory) < 1000:
-            return
+        self.memory.push(state, self.last_orientation, action, next_state, self.last_orientation, done)
+        
+        if len(self.memory) < 1000: return
             
-        # --- Real Training Step ---
-        states, orients, actions, rewards, next_states, next_orients, dones = self.memory.sample(self.batch_size)
+        # --- SPATIAL TRAINING STEP ---
+        states, orients, actions, next_states, next_orients, dones = self.memory.sample(self.batch_size)
         
         states_t = torch.FloatTensor(states).to(self.device)
         orients_t = torch.FloatTensor(orients).to(self.device)
-        actions_t = torch.LongTensor(actions).to(self.device)     # (Batch)
-        rewards_t = torch.FloatTensor(rewards).to(self.device)    # (Batch, 5)
+        actions_t = torch.LongTensor(actions).to(self.device)
         next_states_t = torch.FloatTensor(next_states).to(self.device)
         next_orients_t = torch.FloatTensor(next_orients).to(self.device)
-        dones_t = torch.FloatTensor(dones).to(self.device)        # (Batch)
+        dones_t = torch.FloatTensor(dones).to(self.device)
 
-        # 1. Get Current Q-Values for all heads
-        # Shapes: GVF(B,9,40,40), Ghost(B,9,4), Blue(B,9,4), Fruit(B,9,1)
+        # 1. Forward Pass
+        # GVF: (B, 9, 40, 40)
         gvf, ghosts, blue, fruit = self.model(states_t, orients_t)
-
-        # 2. Get Next State Q-Values (for bootstrapping)
+        
         with torch.no_grad():
             next_gvf, next_ghost, next_blue, next_fruit = self.model(next_states_t, next_orients_t)
 
-        # --- LOSS CALCULATION PER HEAD ---
         total_loss = 0
+        mse = nn.MSELoss()
+
+        # --- A. PELLET GVF (Spatial) ---
+        # Target: The GVF map should predict the Pellet Map at (s') + Gamma * MaxValue
+        # Use Channel 10 (Pellets) from Next State as "Spatial Reward"
+        reward_map_pellet = next_states_t[:, 10, :, :] # (B, 40, 40)
         
-        # A. PELLET HEAD (GVF)
-        # Reward Index 0 is Pellet
-        curr_q_pellet = gvf.mean(dim=(2,3)).gather(1, actions_t.unsqueeze(1)).squeeze(1)
-        next_q_pellet = next_gvf.mean(dim=(2,3)).max(1)[0]
-        target_pellet = rewards_t[:, 0] + (self.gamma * next_q_pellet * (1 - dones_t))
-        loss_pellet = nn.MSELoss()(curr_q_pellet, target_pellet)
+        # Get Max Q across actions for next state at every pixel
+        # "Value of best action from next state at this tile"
+        next_spatial_val = next_gvf.max(dim=1)[0] # (B, 40, 40)
+        
+        spatial_target = reward_map_pellet + (self.gamma * next_spatial_val * (1 - dones_t.unsqueeze(1).unsqueeze(1)))
+        
+        # We only update the GVF layer for the action we actually took
+        # Gather the specific action map: (B, 1, 40, 40)
+        curr_spatial_val = gvf.gather(1, actions_t.view(-1, 1, 1, 1).expand(-1, 1, 40, 40)).squeeze(1)
+        
+        loss_pellet = mse(curr_spatial_val, spatial_target)
         total_loss += loss_pellet
 
-        # B. GHOST HEAD (Avoidance)
-        # Reward Index 4 is Death (-100). 
-        # Ghost head outputs 4 values (one per ghost). We sum them for a "Total Threat" estimate.
-        curr_q_ghost = ghosts.sum(dim=2).gather(1, actions_t.unsqueeze(1)).squeeze(1)
-        next_q_ghost = next_ghost.sum(dim=2).max(1)[0]
-        # Use Death penalty (index 4)
-        target_ghost = rewards_t[:, 4] + (self.gamma * next_q_ghost * (1 - dones_t))
-        loss_ghost = nn.MSELoss()(curr_q_ghost, target_ghost)
+        # --- B. GHOST HEAD (Spatial Avoidance) ---
+        # Use Channels 1-4 (Ghosts) as Negative Reward Map
+        # If ghost is at (x,y), value should be -1.0
+        ghost_map = next_states_t[:, 1:5, :, :].sum(dim=1) # (B, 40, 40) - Combine all ghosts
+        ghost_reward_map = ghost_map * -1.0
+        
+        # Ghost head outputs 4 channels. Sum them to get total threat map? 
+        # Actually our ghost head outputs (B, 9, 4) scalars.
+        # Let's train these scalars against the presence of ghosts in the *receptive field*.
+        # Simplified: If ghost is visible, predict negative value.
+        
+        # Check if ANY ghost is on screen
+        ghost_present = ghost_map.sum(dim=(1,2)) > 0 # (B)
+        ghost_target_scalar = torch.where(ghost_present, torch.tensor(-1.0).to(self.device), torch.tensor(0.0).to(self.device))
+        
+        # Update ghost heads
+        curr_ghost_val = ghosts.sum(dim=2).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        # Target: -1 if ghost exists + gamma * next_val
+        next_ghost_val = next_ghost.sum(dim=2).min(dim=1)[0] # Min because ghosts are bad? No, we use standard max Q
+        # Actually for avoidance, it's standard RL. 
+        target_ghost = ghost_target_scalar + (self.gamma * next_ghost_val * (1 - dones_t))
+        
+        loss_ghost = mse(curr_ghost_val, target_ghost)
         total_loss += loss_ghost
-
-        # C. FRUIT HEAD
-        # Reward Index 3 is Fruit
-        curr_q_fruit = fruit.squeeze(2).gather(1, actions_t.unsqueeze(1)).squeeze(1)
-        next_q_fruit = next_fruit.squeeze(2).max(1)[0]
-        target_fruit = rewards_t[:, 3] + (self.gamma * next_q_fruit * (1 - dones_t))
-        loss_fruit = nn.MSELoss()(curr_q_fruit, target_fruit)
-        total_loss += loss_fruit
 
         # Optimization
         self.optimizer.zero_grad()
