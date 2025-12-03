@@ -1,31 +1,27 @@
 class MsPacManObjectExtractor:
     def __init__(self):
-        # Calibrated colors based on your image
         self.colors = {
-            'pacman': [210, 164, 74],      # Gold/Yellow
-            'ghost_red': [200, 72, 72],    # Red Ghost
-            'ghost_pink': [180, 122, 48],  # Pink Ghost
-            'ghost_cyan': [84, 184, 153],  # Cyan Ghost
-            'ghost_orange': [198, 108, 58],# Orange Ghost
-            'ghost_blue': [66, 114, 194],  # Vulnerable Blue Ghost
-            'fruit': [184, 70, 162],       # Cherry/Fruit
-            
-            # THE CRITICAL COLOR (Shared by Walls and Pellets)
+            'pacman': [210, 164, 74],
+            'ghost_red': [200, 72, 72],
+            'ghost_pink': [180, 122, 48],
+            'ghost_cyan': [84, 184, 153],
+            'ghost_orange': [198, 108, 58],
+            'ghost_blue': [66, 114, 194],
+            'fruit': [184, 70, 162],
             'wall_and_pellet': [228, 111, 111] 
         }
     
     def extract_objects(self, frame):
-        # Crop to playable area (Remove top/bottom HUD)
-        # Original is 210x160. Crop to 160x160.
+        # 1. Crop to playable area (160x160)
         cropped = frame[25:185, :]
         
-        # Resize to 40x40
-        resized = cv2.resize(cropped, (40, 40), interpolation=cv2.INTER_NEAREST)
-        
-        # Initialize channels (11, 40, 40)
+        # 2. Prepare Output Channels (40x40)
         channels = np.zeros((11, 40, 40), dtype=np.float32)
         
-        # --- 1. Extract Simple Objects ---
+        # 3. Create a Low-Res version for big objects (Pacman, Ghosts)
+        resized = cv2.resize(cropped, (40, 40), interpolation=cv2.INTER_NEAREST)
+        
+        # Extract Standard Objects (Big enough to survive resize)
         channels[0] = self._detect_color(resized, self.colors['pacman'])
         channels[1] = self._detect_color(resized, self.colors['ghost_red'])
         channels[2] = self._detect_color(resized, self.colors['ghost_pink'])
@@ -34,38 +30,74 @@ class MsPacManObjectExtractor:
         channels[5] = self._detect_color(resized, self.colors['ghost_blue'])
         channels[9] = self._detect_color(resized, self.colors['fruit'])
         
-        # --- 2. Smart Pellet Detection (Color + Size Filter) ---
-        # Step A: Detect EVERYTHING that is Pink (Walls + Pellets)
-        pink_mask = self._detect_color(resized, self.colors['wall_and_pellet'], tolerance=50)
+        # --- 4. HIGH-RES PELLET DETECTION ---
+        # Detect pink on the ORIGINAL 160x160 frame
+        high_res_pink = self._detect_color(cropped, self.colors['wall_and_pellet'], tolerance=60)
         
-        # Step B: Filter out the big walls
-        # We use connected components to find separate "blobs" of pink
-        # Pellets are small blobs (1-2 pixels in 40x40). Walls are huge blobs.
+        # Convert to uint8 for analysis
+        pink_uint8 = (high_res_pink * 255).astype(np.uint8)
         
-        # Convert mask to uint8 for OpenCV
-        pink_mask_uint8 = (pink_mask * 255).astype(np.uint8)
+        # Connected Components on High-Res
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(pink_uint8, connectivity=8)
         
-        # Find connected components
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(pink_mask_uint8, connectivity=8)
+        # Create a blank High-Res Pellet Mask
+        high_res_pellets = np.zeros_like(high_res_pink)
         
-        pellet_channel = np.zeros_like(pink_mask)
-        
-        # Iterate through all detected pink blobs (start from 1 to skip background)
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            
-            # Heuristic: Pellets are small (e.g., < 6 pixels in 40x40 grid)
-            # Walls are huge connected structures
-            if area < 8: 
-                # This is a pellet! Add it to the channel.
-                pellet_channel[labels == i] = 1.0
+            # In 160x160, a pellet is roughly 2x2 to 4x4 pixels (Area ~4-16)
+            # Walls are massive (> 100)
+            if area < 30: 
+                high_res_pellets[labels == i] = 1.0
                 
-        channels[10] = pellet_channel
+        # 5. Now resize the CLEAN pellet mask to 40x40
+        # Use INTER_AREA to preserve brightness of small dots when shrinking
+        low_res_pellets = cv2.resize(high_res_pellets, (40, 40), interpolation=cv2.INTER_AREA)
+        
+        # Binarize: If any part of a pellet fell into this pixel, mark it
+        channels[10] = (low_res_pellets > 0.01).astype(np.float32)
         
         return channels
 
     def _detect_color(self, frame, target_color, tolerance=45):
-        # Expanded tolerance to catch slight rendering variations
         diff = np.abs(frame.astype(np.int32) - np.array(target_color))
         mask = np.all(diff < tolerance, axis=2)
         return mask.astype(np.float32)
+
+
+def save_debug_view(self, env, path="debug_view.png"):
+        """Saves an image of what the agent actually sees (Channels)"""
+        obs, _ = env.reset()
+        channels = self.object_extractor.extract_objects(obs)
+        
+        # Create a visual grid
+        # Channel 0 (Pacman) + Channel 1-4 (Ghosts) + Channel 10 (Pellets)
+        
+        # Create RGB image: R=Ghosts, G=Pacman, B=Pellets
+        debug_img = np.zeros((40, 40, 3), dtype=np.uint8)
+        
+        # Ghosts (Red Channel)
+        ghost_sum = np.sum(channels[1:5], axis=0)
+        debug_img[:, :, 0] = np.clip(ghost_sum * 255, 0, 255)
+        
+        # Pacman (Green Channel)
+        debug_img[:, :, 1] = np.clip(channels[0] * 255, 0, 255)
+        
+        # Pellets (Blue Channel)
+        debug_img[:, :, 2] = np.clip(channels[10] * 255, 0, 255)
+        
+        # Scale up for visibility (40x40 -> 400x400)
+        large_img = cv2.resize(debug_img, (400, 400), interpolation=cv2.INTER_NEAREST)
+        
+        cv2.imwrite(path, large_img)
+        print(f"Saved debug vision to {path}. CHECK THIS IMAGE!")
+        
+        # Check counts
+        print(f"Debug Counts -> Pellets: {np.sum(channels[10])}, Pacman: {np.sum(channels[0])}")
+
+# ... inside main() ...
+    agent = MicrosoftHRAAgent(num_actions=9, config=config)
+    
+    # RUN THIS DIAGNOSTIC
+    agent.save_debug_view(env, "vision_check.png")
+    # ...
