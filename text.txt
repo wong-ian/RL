@@ -1,0 +1,59 @@
+class MsPacManObjectExtractor:
+    def __init__(self):
+        # We assume standard ALE palette based on your "Pinkish" description
+        self.colors = {
+            'pacman': [210, 164, 74],      # Standard Gold
+            'ghost_red': [200, 72, 72],
+            'ghost_pink': [180, 122, 48],
+            'ghost_cyan': [84, 184, 153],
+            'ghost_orange': [198, 108, 58],
+            'ghost_blue': [66, 114, 194],
+            'fruit': [184, 70, 162],
+            
+            # --- FIXED COLOR: PINKISH PELLET ---
+            'pellet': [228, 111, 111], 
+            # -----------------------------------
+        }
+    
+    def extract_objects(self, frame):
+        # Crop to 160x160 (remove top 25 and bottom 25)
+        cropped = frame[25:185, :]
+        
+        # Resize to 40x40
+        resized = cv2.resize(cropped, (40, 40), interpolation=cv2.INTER_NEAREST)
+        
+        # Initialize channels (11, 40, 40)
+        channels = np.zeros((11, 40, 40), dtype=np.float32)
+        
+        # Channel 0: Ms. Pac-Man
+        channels[0] = self._detect_color(resized, self.colors['pacman'])
+        
+        # Channels 1-4: Individual ghosts
+        channels[1] = self._detect_color(resized, self.colors['ghost_red'])
+        channels[2] = self._detect_color(resized, self.colors['ghost_pink'])
+        channels[3] = self._detect_color(resized, self.colors['ghost_cyan'])
+        channels[4] = self._detect_color(resized, self.colors['ghost_orange'])
+        
+        # Channels 5: Blue ghosts (edible)
+        channels[5] = self._detect_color(resized, self.colors['ghost_blue'])
+        
+        # Channel 9: Fruit
+        channels[9] = self._detect_color(resized, self.colors['fruit'])
+        
+        # Channel 10: Pellets (Using the new Pink color)
+        # We use a higher tolerance (50) to catch slightly darker/lighter pinks
+        channels[10] = self._detect_color(resized, self.colors['pellet'], tolerance=50)
+        
+        return channels
+
+    def _detect_color(self, frame, target_color, tolerance=40):
+        # Calculate absolute difference between frame pixels and target color
+        diff = np.abs(frame.astype(np.int32) - np.array(target_color))
+        
+        # Check if all RGB components are within tolerance
+        mask = np.all(diff < tolerance, axis=2)
+        return mask.astype(np.float32)
+    
+    def _detect_pellets(self, frame):
+        # Deprecated: We now use color detection for higher accuracy
+        pass
