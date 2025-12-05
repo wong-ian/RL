@@ -13,7 +13,7 @@ logger.info("Registering environment.")
 gym.register_envs(ale_py)
 
 # Train the agent based on provided config
-def train(agent: type[BaseAgent], config: BaseConfig, render_human: bool = False, env=None):
+def train(agent: type[BaseAgent], config: BaseConfig, render_human: bool = False):
     
     logger.info("Entered training function.")
     
@@ -25,13 +25,12 @@ def train(agent: type[BaseAgent], config: BaseConfig, render_human: bool = False
 
     # Create gymnasium environment for training
     # https://gymnasium.farama.org/api/env/
-    if env is None:
-        game_environment = "ALE/MsPacman-v5"
+    game_environment = "ALE/MsPacman-v5"
 
-        if render_human:
-            env = gym.make(game_environment, render_mode="human")
-        else:
-            env = gym.make(game_environment)
+    if render_human:
+        env = gym.make(game_environment, render_mode="human")
+    else:
+        env = gym.make(game_environment)
     
     logger.info("Created training environment.")
 
@@ -66,7 +65,7 @@ def train(agent: type[BaseAgent], config: BaseConfig, render_human: bool = False
             needs_to_reset = step_terminated or step_truncated
             
             # Update the agent based on what the results are
-            training_agent.update(observation, action, step_reward, next_observation, needs_to_reset, step_info)
+            training_agent.update(observation, action, step_reward, next_observation, needs_to_reset)
 
             # Update the current state, and increment reward accordingly
             observation = next_observation
@@ -98,9 +97,9 @@ def train(agent: type[BaseAgent], config: BaseConfig, render_human: bool = False
     return model_path
 
 # Make agent play the game for num_episodes given that you already trained it.
-def play(agent_class: type[BaseAgent], config: BaseConfig, model_path: str, num_episodes: int = 5, env=None):
-    if env is None:
-        env = gym.make("ALE/MsPacman-v5", render_mode="human")    
+def play(agent_class: type[BaseAgent], config: BaseConfig, model_path: str, num_episodes: int = 5):
+
+    env = gym.make("ALE/MsPacman-v5", render_mode="human")    
 
     agent = agent_class(env.action_space, config)
     
